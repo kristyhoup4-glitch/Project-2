@@ -1,38 +1,61 @@
 import cv2
 import numpy as np
-import easyocr
+import pytesseract
 import re
 
-# Инициализируем OCR в экономичном режиме памяти
-reader = easyocr.Reader(['ru'], gpu=False, download_enabled=True)
-
 def preprocess_image(image_pil):
-    """Сжатие и базовая очистка изображения для экономии RAM сервера."""
+    """Глубокая бинаризация для удаления фоновой сетки паспорта и бликов."""
     image_np = np.array(image_pil)
     img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
     
-    # Жестко ограничиваем максимальный размер (спасает от ошибки Out of Memory)
+    # 1. Ограничение размера для стабильной работы памяти
     h, w = img.shape[:2]
-    max_size = 1000
+    max_size = 1200
     if max(h, w) > max_size:
-        if w > h:
-            img = cv2.resize(img, (max_size, int(h * (max_size / w))), interpolation=cv2.INTER_AREA)
-        else:
-            img = cv2.resize(img, (int(w * (max_size / h)), max_size), interpolation=cv2.INTER_AREA)
-            
-    # Переводим в градации серого и немного повышаем резкость
+        scale = max_size / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    
+    # 2. Перевод в оттенки серого
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    
+    # 3. Удаление неравномерного освещения и вспышек (Top-Hat морфология)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    gray = cv2.add(cv2.subtract(gray, tophat), blackhat)
+    
+    # 4. Адаптивное превращение в чистый ч/б (метод Оцу + Гаусс)
+    # Это уберет водяные знаки и фоновый узор, оставив только черные буквы
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    return thresh
 
-def clean_text(text):
-    """Очистка строк от мусора OCR."""
-    text = re.sub(r'[^а-яА-Я0-9\s\.\,\-\<\>]', '', text) # Убираем английский мусор и спецсимволы
-    return text.strip()
+def postprocess_numeric_fields(text, mode="num"):
+    """Исправление типичных ошибок OCR (путаница букв и цифр)."""
+    # Замены для цифр (если OCR нашел букву там, где должна быть цифра)
+    if mode == "num":
+        replacements = {'О': '0', 'О': '0', 'З': '3', 'З': '3', 'Б': '6', 'Ч': '4', 'Т': '7', 'І': '1', 'I': '1', 'l': '1'}
+        for char, digit in replacements.items():
+            text = text.replace(char, digit)
+        return re.sub(r'[^0-9\-\s\.]', '', text).strip()
+    
+    # Замены для текста (если OCR нашел цифру в ФИО)
+    if mode == "text":
+        replacements = {'0': 'О', '3': 'З', '4': 'Ч', '1': 'І'}
+        for digit, char in replacements.items():
+            text = text.replace(digit, char)
+        return re.sub(r'[^а-яА-Я\s\-\.]', '', text).strip()
+    return text
 
 def extract_passport_data(image_pil):
-    """Распознавание данных с защитой от утечки памяти."""
-    img = preprocess_image(image_pil)
-    results = reader.readtext(img, detail=1)
+    """Распознавание паспорта с помощью Tesseract OCR."""
+    thresh_img = preprocess_image(image_pil)
+    
+    # Запуск Tesseract с поддержкой русского и английского (для машиночитаемой зоны)
+    # --psm 11 ищет как можно больше текста на странице в любом порядке
+    custom_config = r'--psm 11 -c preserve_interword_spaces=1'
+    raw_text = pytesseract.image_to_string(thresh_img, lang='rus+eng', config=custom_config)
     
     passport_data = {
         "Серия и номер": "Не найдено",
@@ -41,52 +64,47 @@ def extract_passport_data(image_pil):
         "ФИО / Текст": []
     }
     
-    # Сверхгибкие регулярные выражения (учитывают пробелы и опечатки OCR)
+    # Шаблоны регулярных выражений
     passport_num_re = re.compile(r'(\d{2}\s?\d{2}\s?\d{6})|(\d{4}\s?\d{6})')
-    date_re = re.compile(r'\d{2}\s?[\.\,\s]\s?\d{2}\s?[\.\,\s]\s?\d{4}')
-    code_re = re.compile(r'\d{3}\s?[\-\s]\s?\d{3}')
-
-    raw_lines = []
+    date_re = re.compile(r'\d{2}[\.\,\s]\d{2}[\.\,\s]\d{4}')
+    code_re = re.compile(r'\d{3}[\-\s]\d{3}')
     
-    for (bbox, text, prob) in results:
-        if prob < 0.20: # Игнорируем совсем блеклый шум
-            continue
-            
-        text = clean_text(text)
-        if len(text) < 2:
-            continue
-            
-        # Проверяем спец-поля
-        if passport_data["Серия и номер"] == "Не найдено" and passport_num_re.search(text):
-            passport_data["Серия и номер"] = passport_num_re.search(text).group()
-            continue
-            
-        if passport_data["Код подразделения"] == "Не найдено" and code_re.search(text):
-            passport_data["Код подразделения"] = code_re.search(text).group()
-            continue
-
-        if passport_data["Дата выдачи"] == "Не найдено" and date_re.search(text):
-            passport_data["Дата выдачи"] = date_re.search(text).group().replace(' ', '.')
-            continue
-            
-        # Рассчитываем Y-координату для сортировки ФИО
-        y_center = int((bbox[0][1] + bbox[2][1]) / 2)
-        raw_lines.append((y_center, text))
-
-    # Сортируем весь текстовый блок сверху вниз по документу
-    raw_lines.sort(key=lambda x: x[0])
+    lines = raw_text.split('\n')
     
-    # Фильтруем системные слова гознака
-    stop_words = ["паспорт", "гражданина", "российской", "федерации", "уфмс", "овд", "отделом", "отделение", "выдан"]
-    
-    for _, text in raw_lines:
-        # Если строка состоит только из заглавных букв и длиннее 3 символов — это потенциально ФИО
-        if text.isupper() and len(text) > 3:
-            if not any(word in text.lower() for word in stop_words):
-                passport_data["ФИО / Текст"].append(text)
-        # Если ФИО не набралось, берем просто значимый текст
-        elif len(passport_data["ФИО / Текст"]) < 3 and len(text) > 4:
-             if not any(word in text.lower() for word in stop_words) and not text.isdigit():
-                 passport_data["ФИО / Текст"].append(text)
-                 
+    for line in lines:
+        line = line.strip()
+        if len(line) < 3:
+            continue
+            
+        # Ищем Код подразделения
+        code_match = code_re.search(line)
+        if code_match and passport_data["Код подразделения"] == "Не найдено":
+            clean_code = postprocess_numeric_fields(code_match.group(), "num")
+            if len(clean_code) >= 6:
+                passport_data["Код подразделения"] = clean_code
+                continue
+                
+        # Ищем Дату выдачи
+        date_match = date_re.search(line)
+        if date_match and passport_data["Дата выдачи"] == "Не найдено":
+            clean_date = postprocess_numeric_fields(date_match.group(), "num").replace(' ', '.')
+            passport_data["Дата выдачи"] = clean_date
+            continue
+            
+        # Ищем Серию и номер
+        num_match = passport_num_re.search(line)
+        if num_match and passport_data["Серия и номер"] == "Не найдено":
+            passport_data["Серия и номер"] = postprocess_numeric_fields(num_match.group(), "num")
+            continue
+            
+        # Сборка ФИО (строки, состоящие преимущественно из русских букв верхнего регистра)
+        clean_line = postprocess_numeric_fields(line, "text")
+        if clean_line.isupper() and len(clean_line) > 4:
+            # Исключаем служебные слова гознака
+            if not any(word in clean_line.lower() for word in ["паспорт", "гражданина", "российской", "федерации"]):
+                passport_data["ФИО / Текст"].append(clean_line)
+
+    # Ограничиваем ФИО тремя строками (Фамилия, Имя, Отчество)
+    passport_data["ФИО / Текст"] = passport_data["ФИО / Текст"][:3]
+                
     return passport_data
