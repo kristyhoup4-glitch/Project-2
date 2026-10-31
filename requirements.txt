@@ -1,5 +1,5 @@
-streamlit==1.39.0
-easyocr==1.7.1
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-Pillow==10.4.0
+streamlit>=1.35.0
+pytesseract
+opencv-python-headless
+numpy<2.0.0
+Pillow
