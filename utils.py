@@ -26,7 +26,7 @@ def fix_ocr_errors(text, is_numeric=False):
     text = text.strip()
     if is_numeric:
         # Если поле должно состоять из цифр, меняем похожие буквы
-        replacements = {'О': '0', 'О': '0', 'З': '3', 'З': '3', 'Б': '6', 'Ч': '4', 'Т': '7', 'І': '1', 'I': '1', 'l': '1'}
+        replacements = {'О': '0', 'о': '0', 'З': '3', 'з': '3', 'Б': '6', 'Ч': '4', 'Т': '7', 'І': '1', 'I': '1', 'l': '1'}
         for char, digit in replacements.items():
             text = text.replace(char, digit)
         return text
@@ -64,7 +64,6 @@ def extract_passport_data(image_pil):
         clean_line = text.strip("[]|()_")
         
         # 1. Поиск серии и номера
-        # Проверяем строку как с буквами (для исправления опечаток), так и чистую цифровую
         fixed_num_text = fix_ocr_errors(clean_line, is_numeric=True)
         num_match = passport_num_re.search(fixed_num_text)
         if num_match and passport_data["Серия и номер"] == "Не найдено":
@@ -85,12 +84,17 @@ def extract_passport_data(image_pil):
             passport_data["Дата выдачи"] = date_match.group().replace(' ', '.').replace(',', '.')
             continue
             
-        # Сохраняем координату Y для ФИО
-        y_center = int((bbox + bbox) / 2)
+        # ИСПРАВЛЕНО: Безопасное вычисление координаты Y центра текстового блока
+        # bbox имеет структуру: [[x0, y0], [x1, y1], [x2, y2], [x3, y3]]
+        try:
+            y_center = int((bbox[0][1] + bbox[2][1]) / 2)
+        except (IndexError, TypeError):
+            y_center = 0
+            
         raw_lines.append((y_center, clean_line))
         
     # Сортируем текст сверху вниз
-    raw_lines.sort(key=lambda x: x)
+    raw_lines.sort(key=lambda x: x[0])
     
     stop_words = ["паспорт", "гражданина", "российской", "федерации", "уфмс", "овд", "отделом", "отделение", "выдан", "код"]
     
@@ -101,7 +105,6 @@ def extract_passport_data(image_pil):
         
         if len(text_only_letters) > 3:
             if not any(word in text_only_letters.lower() for word in stop_words):
-                # Если строка написана капсом — с высокой вероятностью это ФИО в паспорте
                 if text_only_letters.isupper() or len(passport_data["ФИО / Текст"]) < 3:
                     passport_data["ФИО / Текст"].append(text_only_letters)
                     
